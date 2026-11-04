@@ -1,0 +1,52 @@
+rules_version = '2';
+
+// 所有寫入都只能透過 Cloud Functions（Admin SDK 會略過規則）。客戶端一律不可寫入。
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function roomPath(roomId) {
+      return /databases/$(database)/documents/rooms/$(roomId);
+    }
+
+    function isRoomHost(roomId) {
+      return signedIn() && get(roomPath(roomId)).data.hostUid == request.auth.uid;
+    }
+
+    function isRoomMember(roomId) {
+      return signedIn() && exists(/databases/$(database)/documents/rooms/$(roomId)/members/$(request.auth.uid));
+    }
+
+    match /rooms/{roomId} {
+      // 房間資料只有該房店長與已加入的成員可讀；其他人（含尚未驗證密碼的客人）讀不到。
+      allow get: if signedIn() && (resource.data.hostUid == request.auth.uid || isRoomMember(roomId));
+      // 店長查詢「自己建立的房間」清單：查詢條件必須是 hostUid == 自己。
+      allow list: if signedIn() && resource.data.hostUid == request.auth.uid;
+      allow write: if false;
+
+      // 大廳成員名單：只有店長與同房成員可讀。
+      match /members/{uid} {
+        allow read: if isRoomHost(roomId) || isRoomMember(roomId);
+        allow write: if false;
+      }
+
+      // 秘密職業與個人秘密資訊（下一階段使用）：只有本人可讀，且必須仍是成員；任何人都不能寫。
+      match /private/{uid} {
+        allow read: if signedIn() && request.auth.uid == uid && isRoomMember(roomId);
+        allow write: if false;
+      }
+    }
+
+    // 密碼雜湊：客戶端完全不可存取。
+    match /roomSecrets/{id} {
+      allow read, write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
