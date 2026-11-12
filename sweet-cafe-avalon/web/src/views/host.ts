@@ -5,7 +5,7 @@ import { h, mount, notice, run } from "../dom";
 import { db } from "../firebase";
 import { navigate } from "../nav";
 
-const STATUS_TEXT: Record<string, string> = { created: "尚未開放", open: "開放中", playing: "遊戲進行中", closed: "已關閉" };
+const STATUS_TEXT: Record<string, string> = { created: "準備中", open: "招募中", playing: "遊戲中", closed: "已結束" };
 
 export async function renderHost(root: HTMLElement): Promise<() => void> {
   const user = await authReady();
@@ -41,7 +41,7 @@ function messageView(root: HTMLElement, text: string, withLogout = false): () =>
 
 function dashboard(root: HTMLElement, uid: string): () => void {
   const message = h("div");
-  const password = h("input", { id: "pw", type: "password", minlength: "6", maxlength: "64", required: true, autocomplete: "new-password" });
+  const password = h("input", { id: "pw", type: "text", inputmode: "numeric", pattern: "[0-9]{4}", maxlength: "4", required: true, autocomplete: "off" });
   const mode = h("select", { id: "mode" },
     h("option", { value: "HOST_ONLY" }, "店長只主持，不參與遊戲"),
     h("option", { value: "HOST_IS_PLAYER" }, "店長同時也是玩家"));
@@ -63,15 +63,15 @@ function dashboard(root: HTMLElement, uid: string): () => void {
       });
     },
   },
-    h("label", { for: "pw" }, "房間密碼（6～64 個字元，客人加入時要輸入）"), password,
+    h("label", { for: "pw" }, "房間密碼（4 位數字，可以 0 開頭，玩家加入時要輸入）"), password,
     h("label", { for: "mode" }, "主持模式"), mode, nickRow, submit, message);
 
   const list = h("ul", { class: "list" });
   const q = query(collection(db, "rooms"), where("hostUid", "==", uid));
   const off = onSnapshot(q, (snap) => {
     const rows = snap.docs
-      .map((d) => ({ id: d.id, ...(d.data() as { status: string; createdAtMs: number }) }))
-      .sort((a, b) => b.createdAtMs - a.createdAtMs)
+      .map((d) => ({ id: d.id, ...(d.data() as { status: string; createdAt: { toMillis(): number } | null }) }))
+      .sort((a, b) => (b.createdAt?.toMillis() ?? Date.now()) - (a.createdAt?.toMillis() ?? Date.now()))
       .map((r) => h("li", {}, h("a", { href: `/host/${r.id}`, "data-link": "" }, `房間 ${r.id.slice(0, 6)}…`), h("span", { class: `badge ${r.status}` }, STATUS_TEXT[r.status] ?? r.status)));
     list.replaceChildren(...(rows.length ? rows : [h("li", { class: "muted" }, "還沒有房間")]));
   }, () => list.replaceChildren(h("li", {}, notice("error", "無法讀取房間清單"))));

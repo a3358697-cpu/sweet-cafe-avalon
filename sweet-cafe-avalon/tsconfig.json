@@ -13,7 +13,7 @@
   },
   "include": [
     "src",
-    "functions/src/core",
+    "web/src/lib",
     "tests"
   ]
 }

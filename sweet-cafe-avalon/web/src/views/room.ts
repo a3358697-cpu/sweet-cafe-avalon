@@ -8,7 +8,7 @@ import { navigate } from "../nav";
 type Room = { hostUid: string; hostMode: "HOST_ONLY" | "HOST_IS_PLAYER"; status: "created" | "open" | "playing" | "closed"; maxPlayers: number };
 type Member = { uid: string; nickname: string; role: "host" | "guest" };
 
-const STATUS_TEXT = { created: "尚未開放", open: "開放中，客人可加入", playing: "遊戲進行中", closed: "已關閉" } as const;
+const STATUS_TEXT = { created: "準備中（尚未開放入場）", open: "招募中（玩家可輸入密碼加入）", playing: "遊戲中", closed: "已結束" } as const;
 const MODE_TEXT = { HOST_ONLY: "店長只主持", HOST_IS_PLAYER: "店長也是玩家" } as const;
 
 /** 大廳：即時同步房間狀態與成員。店長（manage=true）多出開放、開始、移除、關閉的按鈕，權限仍由後端驗證。 */
@@ -35,11 +35,11 @@ export async function renderRoom(root: HTMLElement, roomId: string, manage: bool
       h("h1", {}, "遊戲大廳"),
       h("p", {}, `狀態：${STATUS_TEXT[r.status]}　｜　模式：${MODE_TEXT[r.hostMode]}`),
     ];
-    if (r.status === "closed") nodes.push(notice("info", "房間已關閉，密碼已失效。"));
+    if (r.status === "closed") nodes.push(notice("info", "房間已結束，密碼已失效。"));
 
     if (isHostView && r.status !== "closed") {
       const copy = h("button", { type: "button", onclick: () => void navigator.clipboard.writeText(invite).catch(() => undefined) }, "複製邀請網址");
-      nodes.push(h("p", {}, "邀請網址：", h("code", {}, invite)), copy, h("p", { class: "muted" }, "客人需要邀請網址加上你設定的房間密碼才能加入。"));
+      nodes.push(h("p", {}, "邀請網址：", h("code", {}, invite)), copy, h("p", { class: "muted" }, "玩家可從首頁的房間列表或這個網址加入；房間開放入場後，輸入你設定的 4 位數字密碼即可。"));
     }
 
     nodes.push(h("h2", {}, `大廳玩家（${members.length}／${r.maxPlayers}）`));
@@ -56,11 +56,11 @@ export async function renderRoom(root: HTMLElement, roomId: string, manage: bool
     if (isHostView) {
       const buttons: Node[] = [];
       if (r.status === "created") {
-        const b = h("button", { type: "button", onclick: () => void run(b, actionMessage, async () => { await api.openRoom(roomId); }) }, "開放房間");
+        const b = h("button", { type: "button", onclick: () => void run(b, actionMessage, async () => { await api.openRoom(roomId); }) }, "開放入場");
         buttons.push(b);
       }
       if (r.status === "open") {
-        const b = h("button", { type: "button", onclick: () => void run(b, actionMessage, async () => { await api.startGame(roomId); }) }, "開始遊戲（需 6～12 人）");
+        const b = h("button", { type: "button", onclick: () => void run(b, actionMessage, async () => { await api.startGame(roomId); }) }, "開始遊戲（至少 6 人）");
         buttons.push(b);
       }
       if (r.status !== "closed") {

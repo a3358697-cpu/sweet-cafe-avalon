@@ -1,6 +1,12 @@
 rules_version = '2';
 
-// 所有寫入都只能透過 Cloud Functions（Admin SDK 會略過規則）。客戶端一律不可寫入。
+// 純 Firestore 架構（沒有 Cloud Functions）：所有寫入都由瀏覽器直接送出，這份規則是唯一的把關者。
+// 重點：
+//  - 店長 = Google 登入 + 信箱已驗證 + admins/{uid} 白名單文件（只能在 Firebase 主控台手動建立）。
+//  - 房間密碼雜湊放在 roomSecrets（客戶端不可讀）。客人加入時送出自己算的雜湊（joinProofs，同樣不可讀），
+//    由規則在同一批次內以 getAfter() 與 roomSecrets 比對「相等」。這不是伺服器端密碼驗證，
+//    也無法限制猜測次數，詳見 README。
+//  - 人數用 seats/1..12（文件只能建立一次）、暱稱用 nicknames/{編碼後暱稱}（文件只能建立一次）限制。
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -8,41 +14,211 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function adminPath() {
+      return /databases/$(database)/documents/admins/$(request.auth.uid);
+    }
+
+    // 店長：必須以 Google 登入、信箱已驗證，且在 admins 白名單內且 enabled。
+    function isAdminHost() {
+      return signedIn()
+        && request.auth.token.firebase.sign_in_provider == 'google.com'
+        && request.auth.token.email_verified == true
+        && exists(adminPath())
+        && get(adminPath()).data.enabled == true;
+    }
+
     function roomPath(roomId) {
       return /databases/$(database)/documents/rooms/$(roomId);
     }
 
+    function secretPath(roomId) {
+      return /databases/$(database)/documents/roomSecrets/$(roomId);
+    }
+
+    function memberPath(roomId, uid) {
+      return /databases/$(database)/documents/rooms/$(roomId)/members/$(uid);
+    }
+
+    function seatPath(roomId, seatNo) {
+      return /databases/$(database)/documents/rooms/$(roomId)/seats/$(string(seatNo));
+    }
+
+    function nicknamePath(roomId, nickId) {
+      return /databases/$(database)/documents/rooms/$(roomId)/nicknames/$(nickId);
+    }
+
+    function proofPath(roomId, uid) {
+      return /databases/$(database)/documents/rooms/$(roomId)/joinProofs/$(uid);
+    }
+
     function isRoomHost(roomId) {
-      return signedIn() && get(roomPath(roomId)).data.hostUid == request.auth.uid;
+      return isAdminHost() && get(roomPath(roomId)).data.hostUid == request.auth.uid;
     }
 
     function isRoomMember(roomId) {
-      return signedIn() && exists(/databases/$(database)/documents/rooms/$(roomId)/members/$(request.auth.uid));
+      return signedIn() && exists(memberPath(roomId, request.auth.uid));
+    }
+
+    function roomIsLobby(roomId) {
+      return get(roomPath(roomId)).data.status in ['created', 'open'];
+    }
+
+    // 只有管理員白名單：客戶端只能讀自己的那一份（用來決定要不要顯示店長畫面），任何人都不能寫。
+    match /admins/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list, write: if false;
+    }
+
+    // 密碼雜湊：客戶端完全不可讀。只能在「建立新房間」的同一批次建立，關房時由該房店長刪除。
+    match /roomSecrets/{roomId} {
+      allow read, update: if false;
+      allow create: if isAdminHost()
+        && !exists(roomPath(roomId))
+        && getAfter(roomPath(roomId)).data.hostUid == request.auth.uid
+        && getAfter(roomPath(roomId)).data.status == 'created'
+        && request.resource.data.keys().hasOnly(['hashB64'])
+        && request.resource.data.hashB64 is string
+        && request.resource.data.hashB64.size() == 44;
+      allow delete: if isRoomHost(roomId);
     }
 
     match /rooms/{roomId} {
-      // 房間資料只有該房店長與已加入的成員可讀；其他人（含尚未驗證密碼的客人）讀不到。
-      allow get: if signedIn() && (resource.data.hostUid == request.auth.uid || isRoomMember(roomId));
-      // 店長查詢「自己建立的房間」清單：查詢條件必須是 hostUid == 自己。
-      allow list: if signedIn() && resource.data.hostUid == request.auth.uid;
-      allow write: if false;
+      // 房間文件不含祕密（鹽值是公開的），登入者可讀，玩家才能看到狀態並算出密碼雜湊。
+      allow get: if signedIn();
+      // 公開房間列表：登入者（含匿名玩家）可列出房間。房間文件不含任何祕密。
+      allow list: if signedIn();
 
-      // 大廳成員名單：只有店長與同房成員可讀。
-      match /members/{uid} {
-        allow read: if isRoomHost(roomId) || isRoomMember(roomId);
-        allow write: if false;
+      allow create: if isAdminHost()
+        && roomId.matches('^[A-Za-z0-9_-]{20}$')
+        && request.resource.data.keys().hasOnly(['hostUid', 'hostMode', 'status', 'maxPlayers', 'pwSaltB64', 'createdAt', 'openedAt', 'closedAt'])
+        && request.resource.data.keys().hasAll(['hostUid', 'hostMode', 'status', 'maxPlayers', 'pwSaltB64', 'createdAt', 'openedAt', 'closedAt'])
+        && request.resource.data.hostUid == request.auth.uid
+        && request.resource.data.hostMode in ['HOST_ONLY', 'HOST_IS_PLAYER']
+        && request.resource.data.status == 'created'
+        && request.resource.data.maxPlayers == 12
+        && request.resource.data.pwSaltB64 is string
+        && request.resource.data.pwSaltB64.size() == 24
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.openedAt == null
+        && request.resource.data.closedAt == null
+        && existsAfter(secretPath(roomId));
+
+      // 只有建立房間的店長能改狀態，且只能依序：created → open → playing，任何未關閉狀態 → closed。
+      // hostUid、模式、人數上限、鹽值、建立時間都不能改。關閉時必須同批刪除 roomSecrets。
+      allow update: if isAdminHost()
+        && resource.data.hostUid == request.auth.uid
+        && (
+          (resource.data.status == 'created'
+            && request.resource.data.status == 'open'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'openedAt'])
+            && request.resource.data.openedAt == request.time)
+          || (resource.data.status == 'open'
+            && request.resource.data.status == 'playing'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']))
+          || (resource.data.status in ['created', 'open', 'playing']
+            && request.resource.data.status == 'closed'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'closedAt'])
+            && request.resource.data.closedAt == request.time
+            && !existsAfter(secretPath(roomId)))
+        );
+
+      allow delete: if false;
+
+      // 座位：1～12，每個文件只能建立一次，因此人數不會超過 12。登入者可讀（只含 uid），客人才能挑空位。
+      match /seats/{seatId} {
+        allow read: if signedIn();
+        allow create: if signedIn()
+          && seatId.matches('^([1-9]|1[0-2])$')
+          && request.resource.data.keys().hasOnly(['uid'])
+          && request.resource.data.uid == request.auth.uid
+          && existsAfter(memberPath(roomId, request.auth.uid))
+          && getAfter(memberPath(roomId, request.auth.uid)).data.seatNo == int(seatId);
+        allow update: if false;
+        // 只能和成員文件同批刪除（避免占位不放）。
+        allow delete: if signedIn()
+          && roomIsLobby(roomId)
+          && (resource.data.uid == request.auth.uid || isRoomHost(roomId))
+          && !existsAfter(memberPath(roomId, resource.data.uid));
       }
 
-      // 秘密職業與個人秘密資訊（下一階段使用）：只有本人可讀，且必須仍是成員；任何人都不能寫。
+      // 暱稱索引：文件編號由暱稱組成，同名只能建立一次。可「單筆讀取」確認暱稱是否被占用，但不能列出。
+      match /nicknames/{nickId} {
+        allow get: if signedIn();
+        allow list: if false;
+        allow create: if signedIn()
+          && nickId.matches('^n_.+')
+          && request.resource.data.keys().hasOnly(['uid'])
+          && request.resource.data.uid == request.auth.uid
+          && existsAfter(memberPath(roomId, request.auth.uid))
+          && getAfter(memberPath(roomId, request.auth.uid)).data.nickDocId == nickId;
+        allow update: if false;
+        allow delete: if signedIn()
+          && roomIsLobby(roomId)
+          && (resource.data.uid == request.auth.uid || isRoomHost(roomId))
+          && !existsAfter(memberPath(roomId, resource.data.uid));
+      }
+
+      // 密碼證明：客人加入時暫存自己算出的雜湊，供規則在同一批次比對。任何客戶端都不可讀。
+      match /joinProofs/{uid} {
+        allow read, delete: if false;
+        allow create, update: if signedIn()
+          && uid == request.auth.uid
+          && exists(roomPath(roomId))
+          && request.resource.data.keys().hasOnly(['proof'])
+          && request.resource.data.proof is string
+          && request.resource.data.proof.size() == 44;
+      }
+
+      // 大廳成員：只有該房店長與已加入的成員可讀。成員資料建立後不可修改（沒有改暱稱功能）。
+      match /members/{uid} {
+        allow read: if isRoomHost(roomId) || isRoomMember(roomId);
+
+        allow create: if signedIn()
+          && uid == request.auth.uid
+          && request.resource.data.keys().hasOnly(['nickname', 'nickDocId', 'role', 'seatNo', 'joinedAt'])
+          && request.resource.data.nickname is string
+          && request.resource.data.nickname.size() >= 1
+          && request.resource.data.nickname.size() <= 32
+          && request.resource.data.nickDocId is string
+          && request.resource.data.nickDocId.matches('^n_.+')
+          && request.resource.data.seatNo is int
+          && request.resource.data.seatNo >= 1
+          && request.resource.data.seatNo <= 12
+          && request.resource.data.joinedAt == request.time
+          && existsAfter(seatPath(roomId, request.resource.data.seatNo))
+          && getAfter(seatPath(roomId, request.resource.data.seatNo)).data.uid == uid
+          && existsAfter(nicknamePath(roomId, request.resource.data.nickDocId))
+          && getAfter(nicknamePath(roomId, request.resource.data.nickDocId)).data.uid == uid
+          && (
+            // 客人：房間開放中，且附上的密碼證明與 roomSecrets 的雜湊相同（房間關閉後 roomSecrets 已刪除，必定失敗）。
+            (request.resource.data.role == 'guest'
+              && get(roomPath(roomId)).data.status == 'open'
+              && get(roomPath(roomId)).data.hostUid != uid
+              && getAfter(proofPath(roomId, uid)).data.proof == get(secretPath(roomId)).data.hashB64)
+            // 店長兼玩家（HOST_IS_PLAYER）：建立房間時一併加入，不需要密碼。
+            || (request.resource.data.role == 'host'
+              && isAdminHost()
+              && getAfter(roomPath(roomId)).data.hostUid == uid
+              && getAfter(roomPath(roomId)).data.hostMode == 'HOST_IS_PLAYER'
+              && getAfter(roomPath(roomId)).data.status in ['created', 'open'])
+          );
+
+        allow update: if false;
+
+        // 客人自己離開，或店長移除客人；只限遊戲開始前，且必須同批刪除座位與暱稱索引。店長自己不能被刪除。
+        allow delete: if signedIn()
+          && resource.data.role == 'guest'
+          && roomIsLobby(roomId)
+          && (uid == request.auth.uid || isRoomHost(roomId))
+          && !existsAfter(seatPath(roomId, resource.data.seatNo))
+          && !existsAfter(nicknamePath(roomId, resource.data.nickDocId));
+      }
+
+      // 秘密職業與個人秘密資訊（下一階段使用）：只有本人可讀；本階段任何人都不能寫。
       match /private/{uid} {
         allow read: if signedIn() && request.auth.uid == uid && isRoomMember(roomId);
         allow write: if false;
       }
-    }
-
-    // 密碼雜湊：客戶端完全不可存取。
-    match /roomSecrets/{id} {
-      allow read, write: if false;
     }
 
     match /{document=**} {
